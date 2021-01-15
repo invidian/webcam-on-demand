@@ -1,0 +1,9 @@
+[Unit]
+Description=Webcam client watcher starting ffmpeg on demand.
+
+[Service]
+# Use bash to be able to refer to user's home directory.
+ExecStart=/bin/bash -c "~/.local/bin/stream-on-demand"
+
+[Install]
+WantedBy=default.target

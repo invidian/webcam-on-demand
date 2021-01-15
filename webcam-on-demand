@@ -1,0 +1,65 @@
+#!/bin/bash
+
+FALLBACK_IMAGE_PATH=""
+FALLBACK_IMAGE_PATH_DEFAULT="${HOME}/.cache/webcam-on-demand/fallback_image.png"
+
+# 1x1 black pixel in PNG format.
+FALLBACK_IMAGE_DATA="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAAA3NCSVQICAjb4U/gAAAAEHRFWHRTb2Z0d2FyZQBTaHV0dGVyY4LQCQAAAAxJREFUCNdjYGBgAAAABAABJzQnCgAAAABJRU5ErkJggg=="
+
+RESOLUTION_WIDTH="${RESOLUTION_WIDTH:-1920}"
+RESOLUTION_HEIGHT="${RESOLUTION_HEIGHT:-1080}"
+FPS="${FPS:-30}"
+
+V4L2_CONTROLS="${V4L2_CONTROLS:-}" # E.g. "brightness=22,contrast=38"
+INPUT_FORMAT="${INPUT_FORMAT:-h264}"
+V4L2_DEVICE_FILTER="${V4L2_DEVICE_FILTER:-}"
+
+if [[ ! -f "${FALLBACK_IMAGE_PATH}" ]]; then
+  mkdir -p ${HOME}/.cache/webcam-on-demand
+  echo $FALLBACK_IMAGE_DATA | base64 -d > $FALLBACK_IMAGE_PATH_DEFAULT
+  FALLBACK_IMAGE_PATH=$FALLBACK_IMAGE_PATH_DEFAULT
+fi
+
+_term() {
+  echo "Caught SIGTERM signal!"
+  if [ -n "${PID}" ]; then
+    echo "Killing running ffmpeg with PID ${PID}"
+    kill "${PID}"
+  fi
+}
+
+trap _term SIGTERM
+
+OUTPUT=$(v4l2-ctl --list-devices | grep -A1 'VirtualCam' | tail -n1 | awk '{print $1}');
+
+v4l2-ctl -d ${OUTPUT} -c timeout=1000
+v4l2-ctl -d ${OUTPUT} -c keep_format=1
+ffmpeg -loop 1 -t 5 -i $FALLBACK_IMAGE_PATH -f v4l2 -pix_fmt yuv420p -vf scale=${RESOLUTION_WIDTH}:${RESOLUTION_HEIGHT},setsar=1:1,fps=fps=${FPS} ${OUTPUT}
+
+function stream() {
+	echo "--- Detected usage of camera, spinning up FFMPEG"
+	INPUT=$(v4l2-ctl --list-devices | grep -A3 'USB  Live camera: USB  Live cam' | tail -n 1 | awk '{print $1}')
+	v4l2-ctl -d ${INPUT} --set-ctrl=${V4L2_CONTROLS}
+	v4l2-ctl -d ${INPUT} --set-ctrl=${V4L2_CONTROLS}
+	ffmpeg -threads 1 -hwaccel vaapi -f v4l2 -input_format ${INPUT_FORMAT} -framerate ${FPS} -video_size ${RESOLUTION_WIDTH}x${RESOLUTION_HEIGHT} -i ${INPUT} -f v4l2 -pix_fmt yuv420p ${OUTPUT} &
+	PID="${!}"
+	echo "--- PID of ffmpeg is '${PID}'"
+}
+
+if [ "$(lsof -t "${OUTPUT}" | wc -l)" -gt "0" ]; then # Existing clients but we got restarted.
+	stream
+fi
+
+echo "--- Waiting for new video device usage"
+inotifywait -e OPEN,CLOSE -m "${OUTPUT}" |
+while read dir op file; do
+	if [ -n "${PID}" ]; then # streamer is already running
+		if [ "$(lsof -t "${OUTPUT}" | grep -v "${PID}" | wc -l)" -eq "0" ]; then # no more clients
+			echo "--- No more clients, stopping streamer"
+			kill "${PID}"
+			unset PID
+		fi
+	elif [ "$(lsof -t "${OUTPUT}" | wc -l)" -gt "0" ]; then # new clients
+		stream
+	fi
+done
